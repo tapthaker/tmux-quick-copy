@@ -30,51 +30,45 @@ fi
 PANE_ID=$(tmux display-message -p '#{pane_id}')
 echo "PANE_ID: $PANE_ID" >&2
 
+# Get pane position and dimensions
+PANE_LEFT=$(tmux display-message -p '#{pane_left}')
+PANE_TOP=$(tmux display-message -p '#{pane_top}')
+PANE_WIDTH=$(tmux display-message -p '#{pane_width}')
+PANE_HEIGHT=$(tmux display-message -p '#{pane_height}')
+echo "PANE: left=$PANE_LEFT top=$PANE_TOP width=$PANE_WIDTH height=$PANE_HEIGHT" >&2
+
 # Capture visible pane content
 tmux capture-pane -p -t "$PANE_ID" > "$CONTENT_FILE"
 echo "Content captured: $(wc -l < "$CONTENT_FILE") lines" >&2
 
-# Check tmux version for popup support (3.2+)
-TMUX_VERSION=$(tmux -V | cut -d' ' -f2 | tr -d '[:alpha:]')
-echo "TMUX_VERSION: $TMUX_VERSION" >&2
-
-# Run command in popup or new window
-RUN_CMD="cat '$CONTENT_FILE' | '$BINARY' > '$RESULT_FILE' 2>>'$LOG_FILE' || true"
-
-if awk -v ver="$TMUX_VERSION" 'BEGIN {exit !(ver >= 3.2)}'; then
-    # Use popup for seamless overlay (tmux 3.2+)
-    echo "Using popup approach" >&2
-    tmux display-popup -E -w 100% -h 100% "$RUN_CMD"
-else
-    # Use pane swap for older tmux versions
-    echo "Using swap-pane approach" >&2
-
-    # Create new window
-    tmux new-window -d -n "tmux-quick-copy" "$RUN_CMD"
-    TEMP_PANE=$(tmux display-message -p -t "tmux-quick-copy" '#{pane_id}')
-    echo "TEMP_PANE: $TEMP_PANE" >&2
-
-    # Swap with current pane for seamless appearance
-    tmux swap-pane -s "$TEMP_PANE" -t "$PANE_ID"
-
-    # Wait for completion
-    while tmux list-panes -t "tmux-quick-copy" 2>/dev/null | grep -q .; do
-        sleep 0.1
-    done
-
-    # Swap back (window already closed, pane returns to original position)
-    echo "Binary completed" >&2
-fi
+# Run binary in popup positioned exactly over the current pane
+echo "Running binary in popup over current pane" >&2
+# Get current working directory to exclude from matches (often in prompt)
+CURRENT_PWD=$(tmux display-message -p '#{pane_current_path}')
+RUN_CMD="cat '$CONTENT_FILE' | PWD='$CURRENT_PWD' '$BINARY' > '$RESULT_FILE' 2>>'$LOG_FILE' || true"
+tmux display-popup -E -x "$PANE_LEFT" -y "$PANE_TOP" -w "$PANE_WIDTH" -h "$PANE_HEIGHT" "$RUN_CMD"
+echo "Binary completed" >&2
 
 # Read result
 if [ -f "$RESULT_FILE" ] && [ -s "$RESULT_FILE" ]; then
-    SELECTED=$(cat "$RESULT_FILE")
-    echo "SELECTED: $SELECTED" >&2
-    echo "$SELECTED" | tmux load-buffer -
-    tmux display-message "Copied: $SELECTED"
+    RESULT=$(cat "$RESULT_FILE")
+    echo "RESULT: $RESULT" >&2
+
+    # Check if result starts with "PASTE:" prefix
+    if [[ "$RESULT" == PASTE:* ]]; then
+        # Remove "PASTE:" prefix
+        SELECTED="${RESULT#PASTE:}"
+        echo "SELECTED (paste mode): $SELECTED" >&2
+        printf '%s' "$SELECTED" | tmux load-buffer -
+        tmux paste-buffer
+    else
+        # Just copy to buffer
+        echo "SELECTED (copy mode): $RESULT" >&2
+        printf '%s' "$RESULT" | tmux load-buffer -
+        tmux display-message "Copied: $RESULT"
+    fi
 else
-    echo "No selection" >&2
-    tmux display-message "No selection"
+    echo "No selection (dismissed)" >&2
 fi
 
 echo "=== End of log ===" >&2

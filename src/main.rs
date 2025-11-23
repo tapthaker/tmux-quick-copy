@@ -16,6 +16,12 @@ lazy_static! {
         Regex::new(r#"https?://[^\s<>"{}|\\^`\[\]]+"#).unwrap(),
         // File paths (absolute and relative, including ~)
         Regex::new(r"(?:~|\.{1,2})?/[a-zA-Z0-9._@\-/]+").unwrap(),
+        // Git status --short output (files after status markers like " M", "??", "A ")
+        Regex::new(r"^[\sMADRCU?!]{2,3}([^\s].+?)$").unwrap(),
+        // ls -l output (filename at the end after date/time)
+        Regex::new(r"^[drwx-]{10}.*[\d:]+\s+(.+)$").unwrap(),
+        // PIDs from ps output (matches PID column in "F S UID PID ..." format)
+        Regex::new(r"^\s*\d+\s+[A-Z]\s+\d+\s+(\d{3,7})\b").unwrap(),
         // Git SHA (7-40 chars)
         Regex::new(r"\b[0-9a-f]{7,40}\b").unwrap(),
         // IPv4 addresses
@@ -32,7 +38,7 @@ struct Match {
     hint: char,
 }
 
-fn find_matches(content: &str) -> Vec<Match> {
+fn find_matches(content: &str, exclude_path: Option<&str>) -> Vec<Match> {
     let mut matches = Vec::new();
     let mut hint_idx = 0;
 
@@ -43,12 +49,21 @@ fn find_matches(content: &str) -> Vec<Match> {
 
         // Find all matches in this line
         for pattern in PATTERNS.iter() {
-            for capture in pattern.find_iter(line) {
+            for cap in pattern.captures_iter(line) {
                 if hint_idx >= MAX_MATCHES {
                     break;
                 }
 
-                let text = capture.as_str().to_string();
+                // Use capture group 1 if it exists, otherwise use the whole match (group 0)
+                let matched = cap.get(1).or_else(|| cap.get(0)).unwrap();
+                let text = matched.as_str().to_string();
+
+                // Skip if this matches the current working directory (prompt path)
+                if let Some(pwd) = exclude_path {
+                    if text == pwd {
+                        continue;
+                    }
+                }
 
                 // Skip duplicates
                 if matches.iter().any(|m: &Match| m.text == text) {
@@ -58,8 +73,8 @@ fn find_matches(content: &str) -> Vec<Match> {
                 matches.push(Match {
                     text,
                     line: line_num,
-                    start: capture.start(),
-                    end: capture.end(),
+                    start: matched.start(),
+                    end: matched.end(),
                     hint: HINT_CHARS.chars().nth(hint_idx).unwrap(),
                 });
 
@@ -97,13 +112,14 @@ fn render_overlay<W: Write>(content: &str, matches: &[Match], highlighted: Optio
             )?;
         }
 
-        // Show hint at the start of match
+        // Show hint after the match: " <- [hint]"
+        let hint_x = (mat.end + 1) as u16;
         write!(
             tty,
-            "{}{}{}{}{}",
-            cursor::Goto(x, y),
-            color::Bg(color::Red),
-            color::Fg(color::White),
+            "{}{}{} <- [{}]{}",
+            cursor::Goto(hint_x, y),
+            color::Fg(color::Red),
+            style::Bold,
             mat.hint,
             style::Reset
         )?;
@@ -123,8 +139,11 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // Get current working directory to exclude from matches (often in prompt)
+    let exclude_path = std::env::var("PWD").ok();
+
     // Find all matches
-    let matches = find_matches(&content);
+    let matches = find_matches(&content, exclude_path.as_deref());
 
     if matches.is_empty() {
         eprintln!("No matches found");
@@ -132,7 +151,7 @@ fn main() -> io::Result<()> {
     }
 
     // Open /dev/tty for terminal interaction
-    let mut tty = OpenOptions::new()
+    let tty = OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")?;
@@ -147,14 +166,17 @@ fn main() -> io::Result<()> {
     // Input handling from TTY
     let tty_input = tty.try_clone()?;
     let mut selected: Option<&Match> = None;
+    let mut should_paste = false;
 
     for key in tty_input.keys() {
         match key? {
             Key::Char('q') | Key::Esc => break,
             Key::Char(c) => {
-                // Check if this matches a hint
-                if let Some(mat) = matches.iter().find(|m| m.hint == c) {
+                // Check if this matches a hint (lowercase)
+                if let Some(mat) = matches.iter().find(|m| m.hint == c.to_ascii_lowercase()) {
                     selected = Some(mat);
+                    // If capital letter was pressed, mark for paste
+                    should_paste = c.is_ascii_uppercase();
                     break;
                 }
             }
@@ -168,8 +190,13 @@ fn main() -> io::Result<()> {
     drop(tty_raw);
 
     // Output selected text to stdout
+    // Prefix with "PASTE:" if capital letter was used
     if let Some(mat) = selected {
-        println!("{}", mat.text);
+        if should_paste {
+            println!("PASTE:{}", mat.text);
+        } else {
+            println!("{}", mat.text);
+        }
     }
 
     Ok(())
