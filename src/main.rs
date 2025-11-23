@@ -1,7 +1,9 @@
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+use std::process::{Command, Stdio};
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -129,25 +131,13 @@ fn render_overlay<W: Write>(content: &str, matches: &[Match], highlighted: Optio
     Ok(())
 }
 
-fn main() -> io::Result<()> {
-    // Read content from stdin
-    let mut content = String::new();
-    io::stdin().read_to_string(&mut content)?;
-
-    if content.trim().is_empty() {
-        eprintln!("No content received");
-        return Ok(());
-    }
-
-    // Get current working directory to exclude from matches (often in prompt)
-    let exclude_path = std::env::var("PWD").ok();
-
+fn run_selector(content: &str, exclude_path: Option<&str>) -> io::Result<Option<(String, bool)>> {
     // Find all matches
-    let matches = find_matches(&content, exclude_path.as_deref());
+    let matches = find_matches(content, exclude_path);
 
     if matches.is_empty() {
         eprintln!("No matches found");
-        return Ok(());
+        return Ok(None);
     }
 
     // Open /dev/tty for terminal interaction
@@ -161,7 +151,7 @@ fn main() -> io::Result<()> {
     write!(tty_raw, "{}", termion::screen::ToAlternateScreen)?;
     tty_raw.flush()?;
 
-    render_overlay(&content, &matches, None, &mut tty_raw)?;
+    render_overlay(content, &matches, None, &mut tty_raw)?;
 
     // Input handling from TTY
     let tty_input = tty.try_clone()?;
@@ -189,13 +179,99 @@ fn main() -> io::Result<()> {
     tty_raw.flush()?;
     drop(tty_raw);
 
-    // Output selected text to stdout
-    // Prefix with "PASTE:" if capital letter was used
-    if let Some(mat) = selected {
+    // Return selected text and paste flag
+    Ok(selected.map(|mat| (mat.text.clone(), should_paste)))
+}
+
+fn run_tmux_mode() -> io::Result<()> {
+    // Get pane information
+    let pane_id = tmux_cmd(&["display-message", "-p", "#{pane_id}"])?;
+    let pane_current_path = tmux_cmd(&["display-message", "-p", "#{pane_current_path}"])?;
+
+    // Capture pane content
+    let content = tmux_cmd(&["capture-pane", "-p", "-t", &pane_id])?;
+
+    if content.trim().is_empty() {
+        eprintln!("No content captured from pane");
+        return Ok(());
+    }
+
+    // Run selector
+    let result = run_selector(&content, Some(&pane_current_path))?;
+
+    // Handle result
+    if let Some((selected, should_paste)) = result {
+        // Copy to tmux buffer
+        let mut child = Command::new("tmux")
+            .args(&["load-buffer", "-"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(selected.as_bytes())?;
+        }
+        child.wait()?;
+
+        // Paste if requested
         if should_paste {
-            println!("PASTE:{}", mat.text);
+            Command::new("tmux")
+                .args(&["paste-buffer"])
+                .status()?;
         } else {
-            println!("{}", mat.text);
+            // Show message
+            Command::new("tmux")
+                .args(&["display-message", &format!("Copied: {}", selected)])
+                .status()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn tmux_cmd(args: &[&str]) -> io::Result<String> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("tmux command failed: {:?}", args),
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+
+    // Check if running in tmux mode
+    if args.len() > 1 && args[1] == "tmux" {
+        return run_tmux_mode();
+    }
+
+    // Default mode: read from stdin and output selection
+    let mut content = String::new();
+    io::stdin().read_to_string(&mut content)?;
+
+    if content.trim().is_empty() {
+        eprintln!("No content received");
+        return Ok(());
+    }
+
+    // Get current working directory to exclude from matches (often in prompt)
+    let exclude_path = env::var("PWD").ok();
+
+    // Run selector
+    let result = run_selector(&content, exclude_path.as_deref())?;
+
+    // Output selected text to stdout
+    if let Some((text, should_paste)) = result {
+        if should_paste {
+            println!("PASTE:{}", text);
+        } else {
+            println!("{}", text);
         }
     }
 
