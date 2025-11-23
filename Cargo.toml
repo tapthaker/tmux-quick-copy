@@ -1,0 +1,20 @@
+[package]
+name = "tmux-quick-copy"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tapan Thaker"]
+
+[[bin]]
+name = "tmux-quick-copy"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1.11"
+lazy_static = "1.5"
+termion = "4.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
